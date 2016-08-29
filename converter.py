@@ -14,12 +14,12 @@ def meme(filenames, outdir):
 def rpstblastn(input_file_name, output_file_name, database_path):
     return subprocess.run(["rpstblastn", "-query", input_file_name, "-out", output_file_name, "-db", database_path, "-outfmt", "5"])
 
-def makeblastdb(files, db_name, db_type):
-    """ Combines all the fasta files into one fasta file, and then generate
-    all the database with it"""
-    with open(db_name + ".pin", "w") as f:
-        f.write("\n".join(db_name))
-    return subprocess.run(["makeblastdb", "-in", db_name + ".pin", "-dbtype", db_type)
+def blastp(queryfile, db, outfile):
+    return subprocess.run(["blastp", "-query", queryfile, "-db", db, "-out", outfile, "-outfmt", "5"])
+
+def makeblastdb(f, db_type):
+    return subprocess.run(["makeblastdb", "-in", f, "-dbtype", db_type])
+
 
 def filter_matches(filename, e):
     """ Parses the the matches results of rpstblastn and save every match 
@@ -51,33 +51,37 @@ def find_best_match(filename, e):
             best_name = ""
             if record.alignments:
                 for alignment in record.alignments:
-                    locus = alignment.definition.split(" ")[0].split("|")[1]
+                    print(alignment.hit_def)
+                    locus = alignment.hit_def.split(" ")[0].split("|")[1]
                     for hsp in alignment.hsps:
                         if hsp.expect < best:
-                            best_name =  name
+                            best_name = locus
                             best = hsp.expect
 
             if best < e:
                 iden = record.query.split(" ")[0]
-                best_matches[iden] = a_best_ma
+                best_matches[iden] = best_name
 
-    return transcription_factors
+    return best_matches 
 
 def extract_genes(filename, fmt, outname, outfmt, locuses=None):
     """ Extra all proteins coded in the file """
 
-    record = SeqIO.read(filename, fmt)
+    genome = SeqIO.parse(filename, fmt)
     proteins = []
-    for feature in filter(lambda f: f.type == "CDS", record.features):
-        qualifiers = feature.qualifiers
-        if locuses is None or qualifiers["locus_tag"][0] in locuses:
-            protein = SeqRecord(Seq(qualifiers["translation"][0], IUPAC.protein), 
-                id="{0}|{1}".format(record.id, qualifiers["locus_tag"][0]),
-                name=qualifiers["gene"][0],
-                dbxrefs=qualifiers["db_xref"],
-                description=qualifiers["product"][0])
+    for record in genome:
+        for feature in filter(lambda f: f.type == "CDS", record.features):
+            qualifiers = feature.qualifiers
+            if locuses is None or qualifiers["locus_tag"][0] in locuses:
+                name = qualifiers["gene"][0] if "gene" in qualifiers else ""
+                desc = qualifiers["product"][0] if "product" in  qualifiers else ""
+                protein = SeqRecord(Seq(qualifiers["translation"][0], IUPAC.protein), 
+                    id="{0}|{1}".format(record.id, qualifiers["locus_tag"][0]),
+                    name=name,
+                    dbxrefs=qualifiers["db_xref"],
+                    description=desc)
 
-            proteins.append(protein)
+                proteins.append(protein)
     
     SeqIO.write(proteins, outname, outfmt)
 
@@ -94,13 +98,48 @@ def find_transcription_factors(query_id, filename, output_file, profiledb, e):
     print(locuses)
     extract_genes(filename + ".gbk", "genbank", output_file + ".fsa", "fasta", locuses)
     
-def find_orthologs(job_id, test_against_matrix, name ):
-    for query, test_against in test_against_matrix.iter_items():
-        db_name = "{0}-{1}".format(job_id, query)
-        makeblastdb(test_against, db_name, "prot")
-        out_file = "{0}-ortho".format(job_id)
-        blastp(query, db_name, out_file)        
+def find_orthologs(job_id, test_against_matrix):
+    """ Finds the orthologs of in a given set of each query set of genes against a list
+    of others."""
 
+    files = []
+    for query, data in test_against_matrix.items():
+        original_file, test_against = data
+        makeblastdb(original_file, "prot")
+        orthologs = dict()
+        for filename in test_against:
+            makeblastdb(filename, "prot")
+            out_file = "{0}-ortho".format(job_id)
+            blastp(query,filename, out_file)
+            best_locuses = find_best_match(out_file, 1)
+            print(best_locuses)
+
+            query_file = "{0}-query.fsa".format(job_id)            
+            print(filename)
+            print(best_locuses.values())
+            extract_genes(filename, "fasta", query_file, "fasta",  set(best_locuses.values())) 
+
+            blastp(query_file, original_file, out_file)
+            reverse_matricies = find_best_match(out_file)
+            
+            if locus in best_locuses:
+                other_locus = best_locuses[locus]
+                if reverse_matricies[other_locus] == locus:
+                    if not locus in orthologs:
+                        orthologs[locus] = []
+                    orthologs[locus].append(other_locus)
+
+        for original_locus, orthologs in orthologs.items():
+            request = [{"file":original_file, "locuses":[original_locus]}]
+            for ortho_locus, other_file in zip(orthologs, test_against):
+                request.append({"file": other_file, "locuses":[ortho_locus]})
+            
+            result_name = "{0}-memereq.json".format(len(files))
+            files.append(result_name)
+            with open(result_name, "w") as f:
+                f.write(json.dumps(request))
+
+    return files
 
 def extract_upstream(indicies, genome, amount, overlap, min_length=8):
     """ For each index in [indicies], extract [amount] codons before it or
@@ -172,4 +211,11 @@ def find_tfbs(job_id, filename, outdir, upstream, radius, overlap):
         
         
 #find_transcription_factors("1", "511145", "results", "domain-matching/db/Sigma.pin", 1)
-find_tfbs(1, "meme/request.json", "output", 150, 0, False)
+#find_tfbs(1, "meme/request.json", "output", 150, 0, False)
+jobs = frozenset(["211586", "225849", "318167", "319224", "323850", "325240", "326297", "351745", "392500", "398579", "425104", "458817", "60480", "60481", "94122"])
+matrix = dict()
+for job in jobs:
+    test_against = ["meme/{0}".format(other) for other in jobs - set([job])]
+    matrix["query/" + job + ".fsa"] = ("meme/{0}.fsa".format(job), test_against)
+
+find_orthologs(1, matrix)
